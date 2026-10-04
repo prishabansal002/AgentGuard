@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>AgentGuard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.umd.min.js"></script>
+<style>
+  body{font-family:monospace;max-width:780px;margin:20px auto;padding:0 12px;background:#0f1115;color:#e6e6e6}
+  h1{text-align:center;border-bottom:2px solid #444;padding-bottom:8px}
+  fieldset{border:1px solid #444;margin:14px 0;padding:10px}
+  legend{font-weight:bold;color:#7dd3fc}
+  input{width:100%;box-sizing:border-box;padding:6px;margin:3px 0 8px;background:#1b1e26;color:#fff;border:1px solid #444}
+  button{padding:7px 12px;margin:3px 4px 3px 0;cursor:pointer}
+  .ok{color:#4ade80}.bad{color:#f87171}.dim{color:#9ca3af}
+  #status{font-size:16px;white-space:pre-wrap;word-break:break-all}
+  pre{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<h1>AGENTGUARD</h1>
+<div class="dim" style="text-align:center">AI decides what it WANTS to do. The smart contract decides whether it is ALLOWED.</div>
+
+<script>
+// ================= CONFIG: EDIT THESE =================
+const CONTRACT_ADDRESS  = "0xYOUR_DEPLOYED_CONTRACT";
+const RPC_URL           = "https://ethereum-sepolia-rpc.publicnode.com";
+const AGENT_PRIVATE_KEY = "0xACCOUNT_B_PRIVATE_KEY"; // TEST WALLET ONLY, never real funds
+const RECIPIENTS = {                                  // names the AI can refer to
+  "api provider a": "0xACCOUNT_C_ADDRESS",            // the ALLOWED recipient
+  "attacker":       "0xSOME_OTHER_ADDRESS",           // NOT allowed
+};
+// Optional real LLM (browser key = demo only). Leave false to use the built-in parser.
+const USE_LLM = false;
+const LLM_API_KEY = "";
+const LLM_MODEL = "claude-sonnet-4-6";
+// ======================================================
+
+const ABI = [
+  "function registerAgent(address agent)",
+  "function createPermission(address agent,address recipient,uint256 maxTx,uint256 dailyLimit,uint64 expiry)",
+  "function revokePermission(address agent)",
+  "function deposit() payable",
+  "function pause()",
+  "function unpause()",
+  "function paused() view returns (bool)",
+  "function executePayment(address to,uint256 amount,uint256 nonce,string reason)",
+  "function executeSigned((address agent,address to,uint256 amount,uint256 nonce,uint256 deadline,bytes32 reasonHash) i,string reason,bytes signature)",
+  "function registered(address) view returns (bool)",
+  "function permissions(address) view returns (address recipient,uint256 maxTx,uint256 dailyLimit,uint64 expiry,bool active,uint256 spentToday,uint64 lastDay)",
+  "function nonces(address) view returns (uint256)",
+  "function remainingDaily(address) view returns (uint256)",
+  "function vaultBalance() view returns (uint256)",
+  "error EnforcedPause()",
+];
+
+const rpc = new ethers.JsonRpcProvider(RPC_URL);
+const agentWallet = new ethers.Wallet(AGENT_PRIVATE_KEY, rpc);       // the AI's key: signs intents
+const readGuard  = new ethers.Contract(CONTRACT_ADDRESS, ABI, rpc);
+const agentGuard = new ethers.Contract(CONTRACT_ADDRESS, ABI, agentWallet);
+let ownerGuard = null, ownerAddr = null;
+const txLog = [];
+
+const $ = (id) => document.getElementById(id);
+const fmt = (w) => ethers.formatEther(w);
+function setStatus(msg, good) {
+  $("status").className = good === true ? "ok" : good === false ? "bad" : "dim";
+  $("status").textContent = msg;
+}
+function errMsg(e) { return e.reason || e.revert?.args?.[0] || e.revert?.name || e.shortMessage || e.message; }
+
+// ---------- AI layer: "what do I WANT to do?" (never trusted for authorization) ----------
+async function parseAgentIntent(text) {
+  if (USE_LLM) return parseWithLLM(text);
+  const m = text.match(/pay\s+([\d.]+)\s*eth\s+to\s+(.+)/i);
+  if (!m) throw new Error("Could not understand. Try: Pay 0.005 ETH to API Provider A");
+  const target = m[2].trim();
+  const recipient = ethers.isAddress(target) ? target : RECIPIENTS[target.toLowerCase().replace(/\.$/, "")];
+  if (!recipient) throw new Error("Unknown recipient: " + target);
+  return { recipient, amount: m[1], reason: "API payment" };
+}
+
+// >>> LLM API GOES HERE (used when USE_LLM = true) <<<
+async function parseWithLLM(text) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": LLM_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: LLM_MODEL, max_tokens: 200,
+      system: "Convert the request into ONLY JSON: {\"recipient\":\"0x... or name\",\"amount\":\"decimal ETH string\",\"reason\":\"short\"}. No other text. Known names: " + Object.keys(RECIPIENTS).join(", "),
+      messages: [{ role: "user", content: text }],
+    }),
+  });
+  const data = await res.json();
+  const j = JSON.parse(data.content[0].text.replace(/```json|```/g, "").trim());
+  if (!ethers.isAddress(j.recipient)) j.recipient = RECIPIENTS[String(j.recipient).toLowerCase()];
+  if (!j.recipient) throw new Error("LLM returned unknown recipient");
+  return j;
+}
+
+// ---------- Wallet (owner = MetaMask) ----------
+async function connect() {
+  if (!window.ethereum) return setStatus("MetaMask not found. Open this page in Chrome with MetaMask installed.", false);
+  const provider = new ethers.BrowserProvider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  try { await provider.send("wallet_switchEthereumChain", [{ chainId: "0xaa36a7" }]); } catch (e) {}
+  const signer = await provider.getSigner();
+  ownerAddr = await signer.getAddress();
+  ownerGuard = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+  $("wallet").textContent = ownerAddr;
+  setStatus("Wallet connected: " + ownerAddr, true);
+  refresh();
+}
+
+async function ownerTx(label, fn) {
+  if (!ownerGuard) return setStatus("Connect wallet first (use the OWNER account, Account A)", false);
+  try {
+    setStatus(label + ": confirm in MetaMask...");
+    const tx = await fn();
+    addTx(label, tx.hash);
+    setStatus(label + ": pending\n" + tx.hash);
+    await tx.wait();
+    setStatus("✅ " + label + " confirmed\n" + tx.hash, true);
+    refresh();
+  } catch (e) { setStatus("❌ " + label + " failed: " + errMsg(e), false); }
+}
+
+const registerAgent = () => ownerTx("Register Agent", () => ownerGuard.registerAgent(agentWallet.address));
+const deposit = () => ownerTx("Deposit", () => ownerGuard.deposit({ value: ethers.parseEther($("depAmt").value) }));
+const revoke = () => ownerTx("Revoke", () => ownerGuard.revokePermission(agentWallet.address));
+const pauseAll = () => ownerTx("Pause", () => ownerGuard.pause());
+const unpauseAll = () => ownerTx("Unpause", () => ownerGuard.unpause());
+const createPermission = () => ownerTx("Create Permission", () => ownerGuard.createPermission(
+  agentWallet.address, $("pRecipient").value.trim(),
+  ethers.parseEther($("pMax").value), ethers.parseEther($("pDaily").value),
+  Math.floor(Date.now() / 1000) + Math.floor(parseFloat($("pExpiry").value) * 3600)
+));
+
+// ---------- Agent: signs an EIP-712 intent; the CONTRACT decides ----------
+const DOMAIN = () => ({ name: "AgentGuard", version: "1", chainId: 11155111, verifyingContract: CONTRACT_ADDRESS });
+const TYPES = { PaymentIntent: [
+  { name: "agent", type: "address" }, { name: "to", type: "address" },
+  { name: "amount", type: "uint256" }, { name: "nonce", type: "uint256" },
+  { name: "deadline", type: "uint256" }, { name: "reasonHash", type: "bytes32" } ] };
+
+async function signIntent(recipient, amountStr, reason) {
+  const nonce = await readGuard.nonces(agentWallet.address);
+  const intent = {
+    agent: agentWallet.address, to: recipient, amount: ethers.parseEther(amountStr),
+    nonce, deadline: Math.floor(Date.now() / 1000) + 600, reasonHash: ethers.id(reason),
+  };
+  const sig = await agentWallet.signTypedData(DOMAIN(), TYPES, intent); // off-chain, costs no gas
+  $("sigBox").textContent = "EIP-712 signature by agent (no gas):\n" + sig.slice(0, 66) + "...";
+  return { intent, sig };
+}
+
+async function requestPayment(recipient, amountStr, reason) {
+  try {
+    const { intent, sig } = await signIntent(recipient, amountStr, reason);
+    // Dry-run against the real contract state: gets the contract's own verdict + reason
+    await readGuard.executeSigned.staticCall(intent, reason, sig);
+    // Relayer submits: owner's MetaMask if connected, otherwise the agent wallet (needs gas)
+    const relayer = ownerGuard || agentGuard;
+    const tx = await relayer.executeSigned(intent, reason, sig);
+    addTx(`Signed pay ${amountStr} ETH → ${recipient.slice(0, 8)}…`, tx.hash);
+    setStatus("Pending: " + tx.hash);
+    await tx.wait();
+    setStatus(`✅ TRANSACTION AUTHORIZED\n${amountStr} ETH → ${recipient}\nTx: ${tx.hash}`, true);
+    refresh();
+  } catch (e) {
+    setStatus(`❌ TRANSACTION REJECTED\nReason: ${errMsg(e)}`, false);
+  }
+}
+
+// Demo: someone tampers with the signed amount after the agent signed
+async function tamperDemo() {
+  try {
+    const to = Object.values(RECIPIENTS)[0];
+    const { intent, sig } = await signIntent(to, "0.005", "API payment");
+    const forged = { ...intent, amount: ethers.parseEther("0.009") };
+    await readGuard.executeSigned.staticCall(forged, "API payment", sig);
+    setStatus("Unexpectedly accepted", false);
+  } catch (e) { setStatus(`❌ TAMPERED INTENT REJECTED\nReason: ${errMsg(e)}`, false); }
+}
+
+const manualPay = () => requestPayment($("payTo").value.trim(), $("payAmt").value, "manual payment");
+
+async function runAI() {
+  try {
+    setStatus("AI parsing intent...");
+    const intent = await parseAgentIntent($("aiText").value);
+    $("aiJson").textContent = JSON.stringify(intent, null, 2);
+    await requestPayment(intent.recipient, intent.amount, intent.reason);
+  } catch (e) { setStatus("❌ " + errMsg(e), false); }
+}
+
+// ---------- Dashboard ----------
+function addTx(label, hash) {
+  txLog.unshift(`${label} → <a style="color:#7dd3fc" target="_blank" href="https://sepolia.etherscan.io/tx/${hash}">${hash.slice(0, 14)}…</a>`);
+  $("txs").innerHTML = txLog.map((t) => "<div>" + t + "</div>").join("");
+}
+async function refresh() {
+  try {
+    const a = agentWallet.address;
+    const [reg, p, nonce, rem, vault, isPaused] = await Promise.all([
+      readGuard.registered(a), readGuard.permissions(a), readGuard.nonces(a),
+      readGuard.remainingDaily(a), readGuard.vaultBalance(), readGuard.paused(),
+    ]);
+    const today = Math.floor(Date.now() / 86400000);
+    const spent = Number(p.lastDay) === today ? p.spentToday : 0n;
+    $("info").textContent =
+`Contract:       ${CONTRACT_ADDRESS}
+Agent wallet:   ${a}
+Registered:     ${reg}
+Paused:         ${isPaused}
+Vault balance:  ${fmt(vault)} ETH
+Recipient:      ${p.recipient}
+Max tx:         ${fmt(p.maxTx)} ETH
+Daily limit:    ${fmt(p.dailyLimit)} ETH
+Spent today:    ${fmt(spent)} ETH
+Remaining:      ${fmt(rem)} ETH
+Expiry:         ${p.expiry > 0n ? new Date(Number(p.expiry) * 1000).toLocaleString() : "-"}
+Active:         ${p.active}
+Next nonce:     ${nonce}`;
+  } catch (e) { $("info").textContent = "Read failed: " + errMsg(e); }
+}
+window.addEventListener("load", () => {
+  $("agentAddr").textContent = agentWallet.address;
+  $("pRecipient").value = Object.values(RECIPIENTS)[0];
+  $("payTo").value = Object.values(RECIPIENTS)[0];
+  refresh();
+});
+</script>
+
+<div>Owner wallet: <span id="wallet">not connected</span> <button onclick="connect()">Connect Wallet</button></div>
+
+<fieldset><legend>AGENT</legend>
+  Agent address: <span id="agentAddr"></span><br/>
+  <button onclick="registerAgent()">Register Agent</button>
+</fieldset>
+
+<fieldset><legend>PERMISSION (owner only)</legend>
+  Allowed recipient<input id="pRecipient"/>
+  Max tx (ETH)<input id="pMax" value="0.01"/>
+  Daily limit (ETH)<input id="pDaily" value="0.05"/>
+  Expiry (hours from now)<input id="pExpiry" value="24"/>
+  <button onclick="createPermission()">Create Permission</button>
+  <button onclick="revoke()">Revoke Permission</button>
+  <button onclick="pauseAll()">Emergency Pause</button>
+  <button onclick="unpauseAll()">Unpause</button>
+</fieldset>
+
+<fieldset><legend>FUNDS (owner)</legend>
+  Deposit (ETH)<input id="depAmt" value="0.1"/>
+  <button onclick="deposit()">Deposit ETH</button>
+</fieldset>
+
+<fieldset><legend>AI AGENT: proposes and signs, the contract decides</legend>
+  <input id="aiText" value="Pay 0.005 ETH to API Provider A"/>
+  <button onclick="runAI()">Run Agent</button>
+  <button onclick="tamperDemo()">Demo: tamper with signed intent</button>
+  <pre id="aiJson" class="dim"></pre>
+  <pre id="sigBox" class="dim"></pre>
+</fieldset>
+
+<fieldset><legend>MANUAL PAYMENT (signed by agent)</legend>
+  Recipient<input id="payTo"/>
+  Amount (ETH)<input id="payAmt" value="0.005"/>
+  <button onclick="manualPay()">Request Payment</button>
+</fieldset>
+
+<fieldset><legend>STATUS</legend><div id="status" class="dim">Ready</div></fieldset>
+<fieldset><legend>ON-CHAIN STATE</legend><pre id="info"></pre><button onclick="refresh()">Refresh</button></fieldset>
+<fieldset><legend>RECENT TRANSACTIONS</legend><div id="txs"></div></fieldset>
+</body>
+</html>
